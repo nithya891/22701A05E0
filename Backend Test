@@ -1,0 +1,77 @@
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, field_validator
+from typing import Optional
+import time
+import secrets
+import re
+app = FastAPI()
+links = {}
+@app.middleware("http")
+async def save_logs(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    taken = time.time() - start_time
+    with open("logs.txt", "a") as f:
+        f.write(
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+            f"{request.method} {request.url.path} "
+            f"-> {response.status_code} ({taken:.2f}s)\n"
+        )
+    return response
+class LinkInput(BaseModel):
+    original_link: str
+    valid_for: Optional[int] = 30  # minutes
+    custom_name: Optional[str] = None
+    @field_validator("original_link")
+    def check_link(cls, v):
+        regex = re.compile(r"^(http://|https://)([A-Za-z0-9-]+\.)+[A-Za-z]{2,}(:\d+)?(/.*)?$")
+        if not regex.match(v):
+            raise ValueError("Please enter a valid link (must start with http/https)")
+        return v
+    @field_validator("valid_for")
+    def check_time(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("Valid time should be at least 1 minute")
+        return v
+    @field_validator("custom_name")
+    def check_name(cls, v):
+        if v and not re.match(r"^[A-Za-z0-9_-]{4,16}$", v):
+            raise ValueError("Name must be 4–16 characters (letters, numbers, - or _)")
+        return v
+def random_name() -> str:
+    return secrets.token_urlsafe(4).replace("-", "_")
+@app.post("/make")
+def make_short_link(data: LinkInput):
+    short_name = data.custom_name or random_name()
+    if short_name in links:
+        raise HTTPException(status_code=409, detail="This name is already taken")
+    expiry_time = int(time.time()) + (data.valid_for or 30) * 60
+    links[short_name] = {
+        "link": data.original_link,
+        "expires_at": expiry_time,
+        "created_at": int(time.time()),
+        "click_count": 0
+    }
+    return {"short_link": f"/{short_name}", "valid_for_minutes": data.valid_for or 30}
+@app.get("/{short_name}")
+def open_link(short_name: str):
+    entry = links.get(short_name)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Short link not found")
+    if time.time() > entry["expires_at"]:
+        raise HTTPException(status_code=410, detail="This link has expired")
+    entry["click_count"] += 1
+    return RedirectResponse(entry["link"])
+@app.get("/{short_name}/info")
+def link_info(short_name: str):
+    entry = links.get(short_name)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Short link not found")
+    time_left = max(0, entry["expires_at"] - int(time.time()))
+    return {
+        "original_link": entry["link"],
+        "created_at": entry["created_at"],
+        "time_left_seconds": time_left,
+        "total_clicks": entry["click_count"],
+    }
